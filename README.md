@@ -81,15 +81,3 @@ python3 benchmark.py openai-1536
 python3 benchmark.py openai-3072
 ```
 
-## Dependencies
-
-- numpy
-- scipy (for codebook generation only)
-- h5py (for GloVe benchmark)
-- datasets (for OpenAI benchmark download)
-
-## Reference
-
-This is an unofficial implementation. The original paper:
-
-> Zandieh, A., Daliri, M., Hadian, M., & Mirrokni, V. (2025). *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
