@@ -18,15 +18,6 @@ index.save("my_index.tq")
 loaded = TurboQuantIndex.from_bin("my_index.tq")
 ```
 
-## How it works
-
-1. Strip the norm from each vector (stored as 1 float per vector)
-2. Rotate with a random orthogonal matrix so each coordinate follows a known distribution
-3. Quantize each coordinate to a small integer using a precomputed Lloyd-Max codebook
-4. Bit-pack the integers for storage
-
-Search rotates the query into the same domain and scores directly against the packed codes. No decompression needed.
-
 ## Benchmark results
 
 Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results. Benchmarked on Apple M3 Max.
