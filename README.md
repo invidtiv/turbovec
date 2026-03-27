@@ -12,6 +12,8 @@ Unofficial implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (Goo
 from turboquant import TurboQuantIndex
 
 index = TurboQuantIndex.from_vectors(vectors, bit_width=3)
+index.add_vectors(more_vectors)
+
 scores, indices = index.search(query, k=10)
 
 index.save("my_index.tq")
