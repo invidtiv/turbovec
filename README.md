@@ -18,6 +18,22 @@ index.save("my_index.tq")
 loaded = TurboQuantIndex.from_bin("my_index.tq")
 ```
 
+## How it works
+
+Each vector is a direction on a high-dimensional hypersphere. TurboQuant compresses these directions using a simple insight: after applying a random rotation, every coordinate follows a known distribution — regardless of the input data.
+
+**1. Normalize.** Strip the length (norm) from each vector and store it as a single float. Now every vector is a unit direction on the hypersphere.
+
+**2. Random rotation.** Multiply all vectors by the same random orthogonal matrix. After rotation, each coordinate independently follows a Beta distribution that converges to Gaussian N(0, 1/d) in high dimensions. This holds for any input data — the rotation makes the coordinate distribution predictable.
+
+**3. Lloyd-Max scalar quantization.** Since the distribution is known, we can precompute the optimal way to bucket each coordinate. For 2-bit, that's 4 buckets; for 4-bit, 16 buckets. The [Lloyd-Max algorithm](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm) finds bucket boundaries and centroids that minimize mean squared error. These are computed once from the math, not from the data.
+
+**4. Bit-pack.** Each coordinate is now a small integer (0-3 for 2-bit, 0-15 for 4-bit). Pack these tightly into bytes. A 1536-dim vector goes from 6,144 bytes (FP32) to 384 bytes (2-bit). That's 16x compression.
+
+**Search.** Instead of decompressing every database vector, we rotate the query once into the same domain and score directly against the codebook values. Since the rotation is orthogonal: `q . R_inverse(centroids[codes]) = R(q) . centroids[codes]`. One rotation of the query replaces 100K inverse rotations of database vectors.
+
+The paper proves this achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit). You cannot do much better for a given number of bits.
+
 ## Benchmark results
 
 Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results. Benchmarked on Apple M3 Max.
@@ -89,3 +105,9 @@ python3 benchmark.py openai-1536
 python3 benchmark.py openai-3072
 ```
 
+## References
+
+- [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (ICLR 2026) — the paper this implements
+- [QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead](https://arxiv.org/abs/2406.03482) — the 1-bit residual correction technique
+- [PolarQuant: Quantizing KV Caches with Polar Transformation](https://arxiv.org/abs/2502.02617) — related approach using polar coordinates
+- [turboquant-pytorch](https://github.com/tonbistudio/turboquant-pytorch) — PyTorch implementation focused on KV cache compression
