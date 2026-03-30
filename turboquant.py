@@ -111,13 +111,12 @@ def unpack_codes(packed, bits, d, j0=0, j1=None):
 
 
 class TurboQuantIndex:
-    def __init__(self, dim, bit_width, chunk_size=256):
+    def __init__(self, dim, bit_width):
         self.dim = dim
         self.bit_width = bit_width
         self.n_vectors = 0
         self.packed_codes = np.empty((0, 0), dtype=np.uint8)
         self.norms = np.empty(0, dtype=np.float32)
-        self.chunk_size = chunk_size
 
     def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
@@ -165,8 +164,9 @@ class TurboQuantIndex:
         # Chunked scoring: unpack and expand only a slice of dimensions
         # at a time, then BLAS matmul. No full (n, d) array is ever created.
         scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
-        for j0 in range(0, self.dim, self.chunk_size):
-            j1 = min(j0 + self.chunk_size, self.dim)
+        CHUNK = 256
+        for j0 in range(0, self.dim, CHUNK):
+            j1 = min(j0 + CHUNK, self.dim)
             cc = unpack_codes(self.packed_codes, self.bit_width, self.dim, j0, j1)
             chunk_vals = centroids[cc.ravel()].reshape(cc.shape)
             scores += q_rot[:, j0:j1] @ chunk_vals.T
