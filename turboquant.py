@@ -87,13 +87,20 @@ def pack_codes(codes, bits):
     return np.concatenate(planes, axis=1)
 
 
-def unpack_codes(packed, bits, d):
+def unpack_codes(packed, bits, d, j0=0, j1=None):
+    """Unpack bit-plane packed codes to uint8. Optionally unpack only
+    dimensions j0:j1 to avoid allocating the full (n, d) array."""
+    if j1 is None:
+        j1 = d
     bytes_per_plane = d // 8
-    codes = np.zeros((packed.shape[0], d), dtype=np.uint8)
+    b0, b1 = j0 // 8, j1 // 8
+    chunk_d = j1 - j0
+    codes = np.zeros((packed.shape[0], chunk_d), dtype=np.uint8)
     for i in range(bits):
+        plane_offset = i * bytes_per_plane
         plane = np.unpackbits(
-            packed[:, i * bytes_per_plane : (i + 1) * bytes_per_plane], axis=1
-        )[:, :d]
+            packed[:, plane_offset + b0 : plane_offset + b1], axis=1
+        )[:, :chunk_d]
         codes |= plane << i
     return codes
 
@@ -159,18 +166,16 @@ class TurboQuantIndex:
         _, centroids = make_codebook(self.bit_width, self.dim)
         centroids = np.asarray(centroids, dtype=np.float32)
 
-        codes = unpack_codes(self.packed_codes, self.bit_width, self.dim)
-
         Q = make_rotation_matrix(self.dim)
         q_rot = (queries @ Q.T).astype(np.float32)
 
-        # Chunked scoring: expand a slice of codes to centroid floats,
-        # then BLAS matmul. Chunk size controls peak memory.
+        # Chunked scoring: unpack and expand only a slice of dimensions
+        # at a time, then BLAS matmul. No full (n, d) array is ever created.
         scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
         CHUNK = 256
         for j0 in range(0, self.dim, CHUNK):
             j1 = min(j0 + CHUNK, self.dim)
-            cc = codes[:, j0:j1]
+            cc = unpack_codes(self.packed_codes, self.bit_width, self.dim, j0, j1)
             chunk_vals = centroids[cc.ravel()].reshape(cc.shape)
             scores += q_rot[:, j0:j1] @ chunk_vals.T
 
