@@ -94,7 +94,7 @@ unsafe fn score_4bit_block_neon(
     norms: &[f32],
     base_vec: usize,
     n_vectors: usize,
-    row: &mut [f32],
+    out: &mut [f32; BLOCK],
 ) {
     use std::arch::aarch64::*;
 
@@ -173,25 +173,27 @@ unsafe fn score_4bit_block_neon(
         }
     }
 
-    // Write scores with norms (NEON multiply + store)
+    // Write 32 scores to output buffer, applying norms
     let end = (base_vec + BLOCK).min(n_vectors);
-    let row_ptr = row.as_mut_ptr().add(base_vec);
+    let out_ptr = out.as_mut_ptr();
     let norms_ptr = norms.as_ptr().add(base_vec);
 
     if end - base_vec == BLOCK {
-        // Full block: vectorized norm multiply
         for i in 0..8 {
             let n = vld1q_f32(norms_ptr.add(i * 4));
-            vst1q_f32(row_ptr.add(i * 4), vmulq_f32(fa[i], n));
+            vst1q_f32(out_ptr.add(i * 4), vmulq_f32(fa[i], n));
         }
     } else {
-        // Partial block: scalar fallback
         let mut float_accum = [0.0f32; BLOCK];
         for i in 0..8 {
             vst1q_f32(float_accum.as_mut_ptr().add(i * 4), fa[i]);
         }
-        for lane in 0..(end - base_vec) {
-            *row_ptr.add(lane) = float_accum[lane] * *norms_ptr.add(lane);
+        for lane in 0..BLOCK {
+            *out_ptr.add(lane) = if lane < end - base_vec {
+                float_accum[lane] * *norms_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
         }
     }
 }
@@ -633,18 +635,25 @@ fn score_neon_inner(
                 );
 
                 #[cfg(target_arch = "aarch64")]
-                score_4bit_block_neon(
-                    blocked_codes,
-                    &qlut.uint8_luts,
-                    block_offset,
-                    n_byte_groups,
-                    qlut.scale,
-                    qlut.bias,
-                    norms_slice,
-                    base_vec,
-                    n_vectors,
-                    row,
-                );
+                {
+                    let mut block_out = [0.0f32; BLOCK];
+                    score_4bit_block_neon(
+                        blocked_codes,
+                        &qlut.uint8_luts,
+                        block_offset,
+                        n_byte_groups,
+                        qlut.scale,
+                        qlut.bias,
+                        norms_slice,
+                        base_vec,
+                        n_vectors,
+                        &mut block_out,
+                    );
+                    let end = (base_vec + BLOCK).min(n_vectors);
+                    for lane in 0..(end - base_vec) {
+                        *row.get_unchecked_mut(base_vec + lane) = block_out[lane];
+                    }
+                }
 
                 #[cfg(not(target_arch = "aarch64"))]
                 {
@@ -826,95 +835,123 @@ mod py_turboquant {
         let codes_per_byte = 8 / bits;
         let n_byte_groups = dim / codes_per_byte;
 
-        // Per-query: score all blocks, maintain a k-element min-heap.
-        // Never allocates the full (nq, n_vectors) scores matrix.
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
+        // QBS (Query Batch Scoring): parallel over query batches.
+        // Each thread takes a batch of queries, scans ALL blocks once,
+        // and for each block scores all queries in the batch (sharing
+        // the code load). Each query maintains its own k-element heap.
+        const QBS: usize = 4; // queries per batch
+
+        // Prebuild all query LUTs
+        let query_luts: Vec<QueryNeonLut> = (0..nq)
             .into_par_iter()
-            .map(|qi| {
-                let qlut = build_query_neon_lut(q_rot, qi, centroids, bits, dim);
+            .map(|qi| build_query_neon_lut(q_rot, qi, centroids, bits, dim))
+            .collect();
 
-                // Min-heap: track worst score in top-k for fast rejection
-                let mut heap_scores = vec![f32::NEG_INFINITY; k];
-                let mut heap_indices = vec![0u32; k];
-                let mut heap_size = 0usize;
-                let mut heap_min = f32::NEG_INFINITY;
-                let mut heap_min_idx = 0usize;
+        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
+            .step_by(QBS)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|qi_start| {
+                let qi_end = (qi_start + QBS).min(nq);
+                let batch_size = qi_end - qi_start;
 
-                // Per-query row buffer for NEON function output
-                let mut row = vec![0.0f32; n_vectors];
+                // Per-query heaps
+                let mut heap_scores: Vec<Vec<f32>> = (0..batch_size)
+                    .map(|_| vec![f32::NEG_INFINITY; k])
+                    .collect();
+                let mut heap_indices: Vec<Vec<u32>> = (0..batch_size)
+                    .map(|_| vec![0u32; k])
+                    .collect();
+                let mut heap_sizes = vec![0usize; batch_size];
+                let mut heap_mins = vec![f32::NEG_INFINITY; batch_size];
+                let mut heap_min_idxs = vec![0usize; batch_size];
 
                 for block_idx in 0..n_blocks {
                     let base_vec = block_idx * BLOCK;
                     let block_offset = block_idx * n_byte_groups * BLOCK;
 
-                    #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        score_4bit_block_neon(
-                            codes_slice,
-                            &qlut.uint8_luts,
-                            block_offset,
-                            n_byte_groups,
-                            qlut.scale,
-                            qlut.bias,
-                            norms_slice,
-                            base_vec,
-                            n_vectors,
-                            &mut row,
-                        );
-                    }
+                    // Score this block for all queries in the batch.
+                    // Code block loaded once into L1, shared across queries.
+                    for qi_off in 0..batch_size {
+                        let qi = qi_start + qi_off;
+                        let qlut = &query_luts[qi];
 
-                    // Insert block scores into heap
-                    let end = (base_vec + BLOCK).min(n_vectors);
-                    for lane in 0..(end - base_vec) {
-                        let score = row[base_vec + lane];
-                        if heap_size < k {
-                            // Fill heap
-                            heap_scores[heap_size] = score;
-                            heap_indices[heap_size] = (base_vec + lane) as u32;
-                            heap_size += 1;
-                            if heap_size == k {
-                                // Find min
-                                heap_min = heap_scores[0];
-                                heap_min_idx = 0;
-                                for h in 1..k {
-                                    if heap_scores[h] < heap_min {
-                                        heap_min = heap_scores[h];
-                                        heap_min_idx = h;
+                        // Stack-allocated 32-element output — zero heap allocation
+                        let mut block_out = [0.0f32; BLOCK];
+
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            score_4bit_block_neon(
+                                codes_slice,
+                                &qlut.uint8_luts,
+                                block_offset,
+                                n_byte_groups,
+                                qlut.scale,
+                                qlut.bias,
+                                norms_slice,
+                                base_vec,
+                                n_vectors,
+                                &mut block_out,
+                            );
+                        }
+
+                        // Insert into this query's heap
+                        let end = (base_vec + BLOCK).min(n_vectors);
+                        for lane in 0..(end - base_vec) {
+                            let score = block_out[lane];
+                            if heap_sizes[qi_off] < k {
+                                heap_scores[qi_off][heap_sizes[qi_off]] = score;
+                                heap_indices[qi_off][heap_sizes[qi_off]] = (base_vec + lane) as u32;
+                                heap_sizes[qi_off] += 1;
+                                if heap_sizes[qi_off] == k {
+                                    heap_mins[qi_off] = heap_scores[qi_off][0];
+                                    heap_min_idxs[qi_off] = 0;
+                                    for h in 1..k {
+                                        if heap_scores[qi_off][h] < heap_mins[qi_off] {
+                                            heap_mins[qi_off] = heap_scores[qi_off][h];
+                                            heap_min_idxs[qi_off] = h;
+                                        }
                                     }
                                 }
-                            }
-                        } else if score > heap_min {
-                            // Replace min
-                            heap_scores[heap_min_idx] = score;
-                            heap_indices[heap_min_idx] = (base_vec + lane) as u32;
-                            // Recompute min
-                            heap_min = heap_scores[0];
-                            heap_min_idx = 0;
-                            for h in 1..k {
-                                if heap_scores[h] < heap_min {
-                                    heap_min = heap_scores[h];
-                                    heap_min_idx = h;
+                            } else if score > heap_mins[qi_off] {
+                                let mi = heap_min_idxs[qi_off];
+                                heap_scores[qi_off][mi] = score;
+                                heap_indices[qi_off][mi] = (base_vec + lane) as u32;
+                                heap_mins[qi_off] = heap_scores[qi_off][0];
+                                heap_min_idxs[qi_off] = 0;
+                                for h in 1..k {
+                                    if heap_scores[qi_off][h] < heap_mins[qi_off] {
+                                        heap_mins[qi_off] = heap_scores[qi_off][h];
+                                        heap_min_idxs[qi_off] = h;
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // Sort by descending score
-                let mut pairs: Vec<(f32, u32)> = heap_scores[..heap_size]
-                    .iter()
-                    .zip(heap_indices[..heap_size].iter())
-                    .map(|(&s, &i)| (s, i))
-                    .collect();
-                pairs.sort_unstable_by(|a, b| {
-                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                (s, i)
+                // Sort each query's heap
+                (0..batch_size)
+                    .map(|qi_off| {
+                        let sz = heap_sizes[qi_off];
+                        let mut pairs: Vec<(f32, u32)> = heap_scores[qi_off][..sz]
+                            .iter()
+                            .zip(heap_indices[qi_off][..sz].iter())
+                            .map(|(&s, &i)| (s, i))
+                            .collect();
+                        pairs.sort_unstable_by(|a, b| {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                        let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                        (s, i)
+                    })
+                    .collect()
             })
             .collect();
+
+        // Flatten batch results
+        let results: Vec<(Vec<f32>, Vec<i64>)> = results.into_iter().flatten().collect();
 
         let mut top_scores = Array2::<f32>::zeros((nq, k));
         let mut top_indices = Array2::<i64>::zeros((nq, k));
