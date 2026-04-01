@@ -5,6 +5,52 @@ use rayon::prelude::*;
 
 const BLOCK: usize = 32;
 
+/// SIMD dot product of two f32 slices (must be same length, multiple of 4).
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let mut i = 0;
+        while i + 15 < n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
+            acc2 = vfmaq_f32(acc2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
+            acc3 = vfmaq_f32(acc3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+            i += 16;
+        }
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while i + 3 < n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(acc0);
+        while i < n {
+            sum += *ap.add(i) * *bp.add(i);
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0f32;
+        for i in 0..n {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+}
+
 // Max byte groups per uint16 flush batch.
 // With 7-bit LUT entries, hi+lo max = 254 per group.
 // 256 * 254 = 65,024 < 65,535 (uint16 max).
@@ -15,7 +61,9 @@ const FLUSH_EVERY: usize = 256;
 // 16 queries × 24KB LUT = 384KB (fits in L2).
 const QUERY_BATCH: usize = 16;
 
-/// Repack bit-plane codes into SIMD-blocked nibble layout.
+/// Pack bit-plane codes into SIMD-blocked layout.
+/// On x86: FAISS-style perm0-interleaved layout for AVX2 cross-lane compatibility.
+/// On ARM: sequential layout (no interleaving needed, NEON has no cross-lane issue).
 fn repack_inner(
     packed_codes: ArrayView2<u8>,
     bits: usize,
@@ -28,54 +76,91 @@ fn repack_inner(
     let n_blocks = (n + BLOCK - 1) / BLOCK;
     let blocked_size = n_blocks * n_byte_groups * BLOCK;
 
-    let mut blocked = vec![0u8; blocked_size];
+    let perm0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 
+    // Step 1: Extract packed byte per vector per group (same as original repack_inner).
+    // Each byte has codes packed in nibble-aligned positions:
+    //   4-bit: hi nibble = code0, lo nibble = code1
+    //   2-bit: bits 7-6 = code0, 5-4 = code1, 3-2 = code2, 1-0 = code3
+    let mut codes_flat = vec![vec![0u8; n_byte_groups]; n];
+
+    for vec_idx in 0..n {
+        for g in 0..n_byte_groups {
+            let dim_start = g * codes_per_byte;
+            let mut byte_val = 0u8;
+            for c in 0..codes_per_byte {
+                let j = dim_start + c;
+                let byte_in_plane = j / 8;
+                let bit_in_byte = 7 - (j % 8);
+                let mask = 1u8 << bit_in_byte;
+
+                let mut code = 0u8;
+                for p in 0..bits {
+                    let plane_byte = packed_codes[[vec_idx, p * bytes_per_plane + byte_in_plane]];
+                    if plane_byte & mask != 0 {
+                        code |= 1 << p;
+                    }
+                }
+
+                let shift = if bits == 3 {
+                    (codes_per_byte - 1 - c) * 4
+                } else {
+                    (codes_per_byte - 1 - c) * bits
+                };
+                byte_val |= code << shift;
+            }
+            codes_flat[vec_idx][g] = byte_val;
+        }
+    }
+
+    // Step 2: Pack into platform-specific SIMD layout
+    (pack_blocked(n, n_blocks, n_byte_groups, blocked_size, &codes_flat, &perm0), n_blocks)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, blocked_size: usize,
+                codes_flat: &[Vec<u8>], perm0: &[usize; 16]) -> Array1<u8> {
+    // FAISS layout: split each byte into hi/lo nibbles, interleave with perm0.
+    // bytes 0-15 = hi nibbles (sq0) for perm0-interleaved vector pairs
+    // bytes 16-31 = lo nibbles (sq1) for same pairs
+    let mut blocked = vec![0u8; blocked_size];
+    for block_idx in 0..n_blocks {
+        let base_vec = block_idx * BLOCK;
+        for g in 0..n_byte_groups {
+            let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
+            for j in 0..16 {
+                let va = base_vec + perm0[j];
+                let vb = base_vec + perm0[j] + 16;
+                let ba = if va < n { codes_flat[va][g] } else { 0 };
+                let bb = if vb < n { codes_flat[vb][g] } else { 0 };
+                // hi nibbles of both vectors packed into one byte
+                blocked[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
+                // lo nibbles of both vectors packed into one byte
+                blocked[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+            }
+        }
+    }
+    Array1::from_vec(blocked)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pack_blocked(n: usize, n_blocks: usize, n_byte_groups: usize, blocked_size: usize,
+                codes_flat: &[Vec<u8>], _perm0: &[usize; 16]) -> Array1<u8> {
+    // Sequential layout: each byte stored as-is, vectors in order.
+    let mut blocked = vec![0u8; blocked_size];
     for block_idx in 0..n_blocks {
         let base_vec = block_idx * BLOCK;
         for g in 0..n_byte_groups {
             let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
             for lane in 0..BLOCK {
-                let vec_idx = base_vec + lane;
-                if vec_idx >= n {
-                    continue;
+                let vi = base_vec + lane;
+                if vi < n {
+                    blocked[out_offset + lane] = codes_flat[vi][g];
                 }
-
-                let mut byte_val = 0u8;
-                let dim_start = g * codes_per_byte;
-
-                for c in 0..codes_per_byte {
-                    let j = dim_start + c;
-                    let byte_in_plane = j / 8;
-                    let bit_in_byte = 7 - (j % 8);
-                    let mask = 1u8 << bit_in_byte;
-
-                    let mut code = 0u8;
-                    for p in 0..bits {
-                        let plane_byte =
-                            packed_codes[[vec_idx, p * bytes_per_plane + byte_in_plane]];
-                        if plane_byte & mask != 0 {
-                            code |= 1 << p;
-                        }
-                    }
-
-                    // Pack into nibble-aligned positions for NEON.
-                    // For 2-bit (4 codes/byte) and 4-bit (2 codes/byte), bits*codes
-                    // naturally aligns to nibbles. For 3-bit (2 codes/byte), we force
-                    // nibble alignment: code0 → high nibble, code1 → low nibble.
-                    let shift = if bits == 3 {
-                        (codes_per_byte - 1 - c) * 4
-                    } else {
-                        (codes_per_byte - 1 - c) * bits
-                    };
-                    byte_val |= code << shift;
-                }
-
-                blocked[out_offset + lane] = byte_val;
             }
         }
     }
-
-    (Array1::from_vec(blocked), n_blocks)
+    Array1::from_vec(blocked)
 }
 
 // =============================================================================
@@ -83,6 +168,11 @@ fn repack_inner(
 // =============================================================================
 
 // EVOLVE-BLOCK-START
+// Search pipeline: scoring kernel, LUT build, rotation, heap.
+// Optimize for end-to-end search latency on 100K vectors, d=1536, 4-bit.
+// The only entry point that must be preserved is search_inner() — its signature
+// is called from the #[pyfunction] search wrapper below the EVOLVE-BLOCK.
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn score_4bit_block_neon(
     blocked_codes: &[u8],
@@ -197,7 +287,304 @@ unsafe fn score_4bit_block_neon(
         }
     }
 }
-// EVOLVE-BLOCK-END
+
+// =============================================================================
+// AVX2 scoring kernel for x86_64
+// =============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn score_4bit_block_avx2(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    norms: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    // FAISS-style reinterpret trick. 4 uint16 accumulators.
+    // Inner loop: shuffle + reinterpret-as-uint16 add + srli. No add_epi8, no and-mask.
+    // Carry correction at flush. uint16 wrapping is fine — correction recovers exact values.
+    let mask = _mm256_set1_epi8(0x0F);
+    let v_scale = _mm256_set1_ps(scale);
+    let v_bias = _mm256_set1_ps(n_byte_groups as f32 * 2.0 * bias);
+
+    // accu[0]/[1] = lo-nibble even/odd, accu[2]/[3] = hi-nibble even/odd
+    let mut accu = [_mm256_setzero_si256(); 4];
+
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let luts_base = uint8_luts.as_ptr();
+
+    let mut g = 0usize;
+    while g + 3 < n_byte_groups {
+        for gi in 0..4usize {
+            let gg = g + gi;
+            let lp = luts_base.add(gg * 32);
+            let cp = codes_base.add(gg * BLOCK);
+
+            let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp as *const __m128i));
+            let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp.add(16) as *const __m128i));
+            let codes = _mm256_loadu_si256(cp as *const __m256i);
+
+            let clo = _mm256_and_si256(codes, mask);
+            let chi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), mask);
+
+            let res0 = _mm256_shuffle_epi8(lut_lo, clo);
+            let res1 = _mm256_shuffle_epi8(lut_hi, chi);
+
+            accu[0] = _mm256_add_epi16(accu[0], res0);
+            accu[1] = _mm256_add_epi16(accu[1], _mm256_srli_epi16(res0, 8));
+            accu[2] = _mm256_add_epi16(accu[2], res1);
+            accu[3] = _mm256_add_epi16(accu[3], _mm256_srli_epi16(res1, 8));
+        }
+        g += 4;
+    }
+    while g < n_byte_groups {
+        let lp = luts_base.add(g * 32);
+        let cp = codes_base.add(g * BLOCK);
+
+        let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp as *const __m128i));
+        let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp.add(16) as *const __m128i));
+        let codes = _mm256_loadu_si256(cp as *const __m256i);
+
+        let clo = _mm256_and_si256(codes, mask);
+        let chi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), mask);
+
+        let res0 = _mm256_shuffle_epi8(lut_lo, clo);
+        let res1 = _mm256_shuffle_epi8(lut_hi, chi);
+
+        accu[0] = _mm256_add_epi16(accu[0], res0);
+        accu[1] = _mm256_add_epi16(accu[1], _mm256_srli_epi16(res0, 8));
+        accu[2] = _mm256_add_epi16(accu[2], res1);
+        accu[3] = _mm256_add_epi16(accu[3], _mm256_srli_epi16(res1, 8));
+        g += 1;
+    }
+
+    // Carry correction: even bytes accumulated carries into odd bytes.
+    // accu[1] has correct odd scores (srli captured true hi bytes each time).
+    // accu[0] has even + carry pollution. Fix: even = accu[0] - (accu[1] << 8)
+    accu[0] = _mm256_sub_epi16(accu[0], _mm256_slli_epi16(accu[1], 8));
+    accu[2] = _mm256_sub_epi16(accu[2], _mm256_slli_epi16(accu[3], 8));
+
+    // Combine lo+hi nibble in float to avoid uint16 overflow
+    let ae0_lo = _mm256_castsi256_si128(accu[0]);
+    let ae0_hi = _mm256_extracti128_si256(accu[0], 1);
+    let ao0_lo = _mm256_castsi256_si128(accu[1]);
+    let ao0_hi = _mm256_extracti128_si256(accu[1], 1);
+    let ae2_lo = _mm256_castsi256_si128(accu[2]);
+    let ae2_hi = _mm256_extracti128_si256(accu[2], 1);
+    let ao2_lo = _mm256_castsi256_si128(accu[3]);
+    let ao2_hi = _mm256_extracti128_si256(accu[3], 1);
+
+    // Interleave even/odd → sequential, for lo-nibble and hi-nibble separately
+    let lo_01 = _mm_unpacklo_epi16(ae0_lo, ao0_lo);
+    let lo_23 = _mm_unpackhi_epi16(ae0_lo, ao0_lo);
+    let lo_45 = _mm_unpacklo_epi16(ae0_hi, ao0_hi);
+    let lo_67 = _mm_unpackhi_epi16(ae0_hi, ao0_hi);
+    let hi_01 = _mm_unpacklo_epi16(ae2_lo, ao2_lo);
+    let hi_23 = _mm_unpackhi_epi16(ae2_lo, ao2_lo);
+    let hi_45 = _mm_unpacklo_epi16(ae2_hi, ao2_hi);
+    let hi_67 = _mm_unpackhi_epi16(ae2_hi, ao2_hi);
+
+    // Convert to float and sum lo + hi contributions
+    let f0 = _mm256_add_ps(
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_01)),
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_01)));
+    let f1 = _mm256_add_ps(
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_23)),
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_23)));
+    let f2 = _mm256_add_ps(
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_45)),
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_45)));
+    let f3 = _mm256_add_ps(
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_67)),
+        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_67)));
+
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let out_ptr = out.as_mut_ptr();
+    let norms_ptr = norms.as_ptr().add(base_vec);
+    if end - base_vec == BLOCK {
+        for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
+            let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
+            let n = _mm256_loadu_ps(norms_ptr.add(i * 8));
+            _mm256_storeu_ps(out_ptr.add(i * 8), _mm256_mul_ps(scored, n));
+        }
+    } else {
+        let mut float_accum = [0.0f32; BLOCK];
+        for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
+            _mm256_storeu_ps(float_accum.as_mut_ptr().add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
+        }
+        for lane in 0..BLOCK {
+            *out_ptr.add(lane) = if lane < end - base_vec {
+                float_accum[lane] * *norms_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
+}
+
+/// Fused multi-query scoring + heap top-k. Processes NQ=4 queries per block,
+/// sharing code loads. No score array materialization — heap updated per block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn search_multi_query_avx2(
+    blocked_codes: &[u8],
+    luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    norms: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u32>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
+    let mask = _mm256_set1_epi8(0x0F);
+    let codes_base = blocked_codes.as_ptr();
+
+    for b in 0..n_blocks {
+        let base_vec = b * BLOCK;
+        let mut accus = [[_mm256_setzero_si256(); 4]; 4];
+
+        for g in 0..n_byte_groups {
+            let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
+            let codes_v = _mm256_loadu_si256(cp as *const __m256i);
+            let clo = _mm256_and_si256(codes_v, mask);
+            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask);
+
+            for qi in 0..4 {
+                let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                let res0 = _mm256_shuffle_epi8(lut, clo);
+                let res1 = _mm256_shuffle_epi8(lut, chi);
+                accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
+                accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
+                accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
+                accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+            }
+        }
+
+        let end = (base_vec + BLOCK).min(n_vectors);
+        let norms_ptr = norms.as_ptr().add(base_vec);
+
+        for qi in 0..nq {
+            let v_scale = _mm256_set1_ps(scales[qi]);
+            let v_bias = _mm256_set1_ps(n_byte_groups as f32 * 2.0 * biases[qi]);
+
+            accus[qi][0] = _mm256_sub_epi16(accus[qi][0], _mm256_slli_epi16(accus[qi][1], 8));
+            accus[qi][2] = _mm256_sub_epi16(accus[qi][2], _mm256_slli_epi16(accus[qi][3], 8));
+
+            let dis0 = _mm256_add_epi16(
+                _mm256_permute2x128_si256(accus[qi][0], accus[qi][1], 0x21),
+                _mm256_blend_epi32(accus[qi][0], accus[qi][1], 0xF0),
+            );
+            let dis1 = _mm256_add_epi16(
+                _mm256_permute2x128_si256(accus[qi][2], accus[qi][3], 0x21),
+                _mm256_blend_epi32(accus[qi][2], accus[qi][3], 0xF0),
+            );
+
+            let mut block_out = [0.0f32; BLOCK];
+            let bp = block_out.as_mut_ptr();
+            let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
+            let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
+            let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
+            let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+
+            if end - base_vec == BLOCK {
+                for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
+                    let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
+                    let n = _mm256_loadu_ps(norms_ptr.add(i * 8));
+                    _mm256_storeu_ps(bp.add(i * 8), _mm256_mul_ps(scored, n));
+                }
+            } else {
+                for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
+                    _mm256_storeu_ps(bp.add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
+                }
+                for lane in 0..(end - base_vec) {
+                    block_out[lane] *= *norms_ptr.add(lane);
+                }
+                for lane in (end - base_vec)..BLOCK {
+                    block_out[lane] = f32::NEG_INFINITY;
+                }
+            }
+
+            // Heap insertion with SIMD early rejection.
+            // Check if any score in each 8-element chunk exceeds heap min.
+            // Skip entire chunks where max(chunk) <= heap_min.
+            let hs = &mut heap_scores[qi];
+            let hi = &mut heap_indices[qi];
+            let sz = &mut heap_sizes[qi];
+            let hmin = &mut heap_mins[qi];
+            let hmi = &mut heap_min_idxs[qi];
+
+            if *sz < k {
+                // Filling phase — just insert everything
+                for lane in 0..(end - base_vec) {
+                    hs[*sz] = block_out[lane];
+                    hi[*sz] = (base_vec + lane) as u32;
+                    *sz += 1;
+                    if *sz == k {
+                        *hmin = hs[0]; *hmi = 0;
+                        for h in 1..k {
+                            if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
+                        }
+                    }
+                }
+            } else {
+                // SIMD max check per 8-float chunk, skip if no candidates
+                let v_hmin = _mm256_set1_ps(*hmin);
+                for chunk in 0..4 {
+                    let chunk_start = chunk * 8;
+                    if chunk_start >= end - base_vec { break; }
+                    let scores_v = _mm256_loadu_ps(block_out.as_ptr().add(chunk_start));
+                    let cmp = _mm256_cmp_ps(scores_v, v_hmin, _CMP_GT_OQ);
+                    if _mm256_movemask_ps(cmp) == 0 { continue; } // all <= min, skip
+
+                    let chunk_end = (chunk_start + 8).min(end - base_vec);
+                    for lane in chunk_start..chunk_end {
+                        let score = block_out[lane];
+                        if score > *hmin {
+                            hs[*hmi] = score;
+                            hi[*hmi] = (base_vec + lane) as u32;
+                            // SIMD min-find over k=64 heap entries (8 chunks of 8)
+                            let hp = hs.as_ptr();
+                            let mut vmin = _mm256_loadu_ps(hp);
+                            for c in 1..(k / 8) {
+                                vmin = _mm256_min_ps(vmin, _mm256_loadu_ps(hp.add(c * 8)));
+                            }
+                            // Horizontal min of 8 floats
+                            let lo = _mm256_castps256_ps128(vmin);
+                            let hi128 = _mm256_extractf128_ps(vmin, 1);
+                            let m4 = _mm_min_ps(lo, hi128);
+                            let m2 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
+                            let m1 = _mm_min_ps(m2, _mm_shuffle_ps(m2, m2, 1));
+                            *hmin = _mm_cvtss_f32(m1);
+                            // Find index of min (scalar scan, but only after SIMD found the value)
+                            *hmi = 0;
+                            for h in 1..k {
+                                if hs[h] < hs[*hmi] { *hmi = h; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Repack 3-bit codes into two blocked arrays:
 /// - sub_codes: 2-bit nibble format from planes 0,1
@@ -494,6 +881,16 @@ fn build_query_neon_lut(
     bits: usize,
     dim: usize,
 ) -> QueryNeonLut {
+    let row = q_rot.row(qi);
+    build_query_neon_lut_from_slice(row.as_slice().unwrap(), centroids, bits, dim)
+}
+
+fn build_query_neon_lut_from_slice(
+    q_rot_row: &[f32],
+    centroids: ArrayView1<f32>,
+    bits: usize,
+    dim: usize,
+) -> QueryNeonLut {
     let codes_per_byte = 8 / bits;
     let codes_per_nibble = codes_per_byte / 2;
     let n_byte_groups = dim / codes_per_byte;
@@ -513,7 +910,7 @@ fn build_query_neon_lut(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot[[qi, dim_start + c]] * centroids[code as usize];
+                s += q_rot_row[dim_start + c] * centroids[code as usize];
             }
             float_vals[g * 32 + nibble_val as usize] = s;
             global_min = global_min.min(s);
@@ -526,7 +923,7 @@ fn build_query_neon_lut(
             for c in 0..codes_per_nibble {
                 let shift = (codes_per_nibble - 1 - c) * bits;
                 let code = (nibble_val >> shift) & code_mask;
-                s += q_rot[[qi, dim_start + codes_per_nibble + c]] * centroids[code as usize];
+                s += q_rot_row[dim_start + codes_per_nibble + c] * centroids[code as usize];
             }
             float_vals[g * 32 + 16 + nibble_val as usize] = s;
             global_min = global_min.min(s);
@@ -535,11 +932,17 @@ fn build_query_neon_lut(
     }
 
     let range = global_max - global_min;
-    let scale = if range > 1e-10 { range / 127.0 } else { 1.0 };
+    // On x86, max_lut ensures combine2x2 (adding two sub-quantizer totals) fits in uint16.
+    // On ARM, no combine2x2 — use full 7-bit range (127) for best precision.
+    #[cfg(target_arch = "x86_64")]
+    let max_lut = (65535.0 / (n_byte_groups as f64 * 2.0)).floor().min(127.0) as f32;
+    #[cfg(not(target_arch = "x86_64"))]
+    let max_lut = 127.0f32;
+    let scale = if range > 1e-10 { range / max_lut } else { 1.0 };
     let bias = global_min;
 
     for i in 0..float_vals.len() {
-        uint8_luts[i] = ((float_vals[i] - bias) / scale).round().min(127.0) as u8;
+        uint8_luts[i] = ((float_vals[i] - bias) / scale).round().min(max_lut) as u8;
     }
 
     QueryNeonLut { uint8_luts, scale, bias }
@@ -604,12 +1007,32 @@ fn score_neon_inner(
                 );
 
                 #[cfg(not(target_arch = "aarch64"))]
-                { /* scalar fallback */ }
+                {
+                    // x86_64: use AVX2 for each query individually
+                    for q in qi..qi+4 {
+                        let qlut = &query_luts[q];
+                        let mut block_out = [0.0f32; BLOCK];
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            if is_x86_feature_detected!("avx2") {
+                                score_4bit_block_avx2(
+                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                    qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
+                                );
+                            }
+                        }
+                        let row = std::slice::from_raw_parts_mut(ptr.add(q * n_vectors), n_vectors);
+                        let end = (base_vec + BLOCK).min(n_vectors);
+                        for lane in 0..(end - base_vec) {
+                            *row.get_unchecked_mut(base_vec + lane) = block_out[lane];
+                        }
+                    }
+                }
             }
             qi += 4;
         }
 
-        // Handle remaining 1-3 queries with 2-query function
+        // Handle remaining 1-3 queries
         while qi + 1 < nq {
             unsafe {
                 #[cfg(target_arch = "aarch64")]
@@ -622,6 +1045,28 @@ fn score_neon_inner(
                     std::slice::from_raw_parts_mut(ptr.add(qi * n_vectors), n_vectors),
                     std::slice::from_raw_parts_mut(ptr.add((qi+1) * n_vectors), n_vectors),
                 );
+
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    for q in qi..qi+2 {
+                        let qlut = &query_luts[q];
+                        let mut block_out = [0.0f32; BLOCK];
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            if is_x86_feature_detected!("avx2") {
+                                score_4bit_block_avx2(
+                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                    qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
+                                );
+                            }
+                        }
+                        let row = std::slice::from_raw_parts_mut(ptr.add(q * n_vectors), n_vectors);
+                        let end = (base_vec + BLOCK).min(n_vectors);
+                        for lane in 0..(end - base_vec) {
+                            *row.get_unchecked_mut(base_vec + lane) = block_out[lane];
+                        }
+                    }
+                }
             }
             qi += 2;
         }
@@ -657,27 +1102,19 @@ fn score_neon_inner(
 
                 #[cfg(not(target_arch = "aarch64"))]
                 {
-                    let mut block_scores = [0.0f32; BLOCK];
-                    for g in 0..n_byte_groups {
-                        let codes_start = block_offset + g * BLOCK;
-                        let mut lut_hi = [0.0f32; 16];
-                        let mut lut_lo = [0.0f32; 16];
-                        for c in 0..16usize {
-                            lut_hi[c] = qlut.scale * qlut.uint8_luts[g * 32 + c] as f32 + qlut.bias;
-                            lut_lo[c] = qlut.scale * qlut.uint8_luts[g * 32 + 16 + c] as f32 + qlut.bias;
-                        }
-                        for lane in 0..BLOCK {
-                            let byte_val = *blocked_codes.get_unchecked(codes_start + lane);
-                            let hi = (byte_val >> 4) as usize;
-                            let lo = (byte_val & 0x0F) as usize;
-                            *block_scores.get_unchecked_mut(lane) +=
-                                *lut_hi.get_unchecked(hi) + *lut_lo.get_unchecked(lo);
+                    let mut block_out = [0.0f32; BLOCK];
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if is_x86_feature_detected!("avx2") {
+                            score_4bit_block_avx2(
+                                blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
+                            );
                         }
                     }
                     let end = (base_vec + BLOCK).min(n_vectors);
                     for lane in 0..(end - base_vec) {
-                        *row.get_unchecked_mut(base_vec + lane) =
-                            *block_scores.get_unchecked(lane) * *norms_slice.get_unchecked(base_vec + lane);
+                        *row.get_unchecked_mut(base_vec + lane) = block_out[lane];
                     }
                 }
             }
@@ -879,20 +1316,22 @@ mod py_turboquant {
                         // Stack-allocated 32-element output — zero heap allocation
                         let mut block_out = [0.0f32; BLOCK];
 
-                        #[cfg(target_arch = "aarch64")]
                         unsafe {
+                            #[cfg(target_arch = "aarch64")]
                             score_4bit_block_neon(
-                                codes_slice,
-                                &qlut.uint8_luts,
-                                block_offset,
-                                n_byte_groups,
-                                qlut.scale,
-                                qlut.bias,
-                                norms_slice,
-                                base_vec,
-                                n_vectors,
-                                &mut block_out,
+                                codes_slice, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
                             );
+
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if is_x86_feature_detected!("avx2") {
+                                    score_4bit_block_avx2(
+                                        codes_slice, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                        qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
+                                    );
+                                }
+                            }
                         }
 
                         // Insert into this query's heap
@@ -965,8 +1404,6 @@ mod py_turboquant {
         (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
     }
 
-    /// Full search: rotation + scoring + heap top-k, all in Rust.
-    /// Rotation uses ndarray dot (BLAS-backed on some platforms).
     #[pyfunction]
     fn search<'py>(
         py: Python<'py>,
@@ -981,28 +1418,75 @@ mod py_turboquant {
         n_blocks: usize,
         k: usize,
     ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>) {
-        let queries = queries.as_array();
-        let rotation = rotation.as_array();
-        let blocked_codes = blocked_codes.as_array();
-        let centroids = centroids.as_array();
-        let norms = norms.as_array();
-        let codes_slice = blocked_codes.as_slice().unwrap();
-        let norms_slice = norms.as_slice().unwrap();
-        let nq = queries.nrows();
-        let k = k.min(n_vectors);
-        let n_byte_groups = dim / (8 / bits);
+        let (top_scores, top_indices) = search_inner(
+            queries.as_array(), rotation.as_array(),
+            blocked_codes.as_array(), centroids.as_array(), norms.as_array(),
+            bits, dim, n_vectors, n_blocks, k,
+        );
+        (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
+    }
+}
 
-        // Rotation: q_rot = queries @ rotation.T, then parallel LUT build
-        let q_rot = queries.dot(&rotation.t());
+/// Full search: rotation + LUT build + scoring + heap top-k.
+/// This is the main function to optimize for end-to-end search latency.
+fn search_inner(
+    queries: ArrayView2<f32>,
+    rotation: ArrayView2<f32>,
+    blocked_codes: ArrayView1<u8>,
+    centroids: ArrayView1<f32>,
+    norms: ArrayView1<f32>,
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+) -> (Array2<f32>, Array2<i64>) {
+    let codes_slice = blocked_codes.as_slice().unwrap();
+    let norms_slice = norms.as_slice().unwrap();
+    let nq = queries.nrows();
+    let k = k.min(n_vectors);
+    let n_byte_groups = dim / (8 / bits);
 
-        let query_luts: Vec<QueryNeonLut> = (0..nq)
-            .into_par_iter()
-            .map(|qi| build_query_neon_lut(q_rot.view(), qi, centroids, bits, dim))
-            .collect();
+    let t_start = std::time::Instant::now();
 
-        // QBS scoring + heap top-k (same as score_topk)
+    // Parallel rotation
+    use numpy::ndarray::s;
+    let rot_t = rotation.t();
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk = (nq + n_threads - 1) / n_threads;
+    let q_rot_chunks: Vec<Array2<f32>> = (0..nq)
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|start| {
+            let end = (start + chunk).min(nq);
+            queries.slice(s![start..end, ..]).dot(&rot_t)
+        })
+        .collect();
+
+    let mut q_rot_flat = Vec::with_capacity(nq * dim);
+    for c in &q_rot_chunks {
+        q_rot_flat.extend_from_slice(c.as_slice().unwrap());
+    }
+
+    let t_rot = t_start.elapsed().as_micros();
+
+    let query_luts: Vec<QueryNeonLut> = (0..nq)
+        .into_par_iter()
+        .map(|qi| {
+            let row = &q_rot_flat[qi * dim..(qi + 1) * dim];
+            build_query_neon_lut_from_slice(row, centroids, bits, dim)
+        })
+        .collect();
+
+    let t_lut = t_start.elapsed().as_micros() - t_rot;
+    let t_score_start = std::time::Instant::now();
+
+    // Platform-specific scoring + top-k.
+    #[cfg(target_arch = "aarch64")]
+    let results = {
+        // ARM: per-block scoring with inline heap (LUT stays in L1 naturally via vqtbl1q_u8)
         const QBS: usize = 4;
-
         let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
             .step_by(QBS)
             .collect::<Vec<_>>()
@@ -1028,22 +1512,12 @@ mod py_turboquant {
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
                         let qlut = &query_luts[qi];
-
                         let mut block_out = [0.0f32; BLOCK];
 
-                        #[cfg(target_arch = "aarch64")]
                         unsafe {
                             score_4bit_block_neon(
-                                codes_slice,
-                                &qlut.uint8_luts,
-                                block_offset,
-                                n_byte_groups,
-                                qlut.scale,
-                                qlut.bias,
-                                norms_slice,
-                                base_vec,
-                                n_vectors,
-                                &mut block_out,
+                                codes_slice, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                qlut.scale, qlut.bias, norms_slice, base_vec, n_vectors, &mut block_out,
                             );
                         }
 
@@ -1099,18 +1573,95 @@ mod py_turboquant {
                     .collect()
             })
             .collect();
+        results.into_iter().flatten().collect::<Vec<_>>()
+    };
 
-        let results: Vec<(Vec<f32>, Vec<i64>)> = results.into_iter().flatten().collect();
+    #[cfg(target_arch = "x86_64")]
+    let results = {
+        // Fused multi-query scoring + heap: batch NQ=4 queries, share code loads.
+        const NQ_BATCH: usize = 4;
 
-        let mut top_scores = Array2::<f32>::zeros((nq, k));
-        let mut top_indices = Array2::<i64>::zeros((nq, k));
-        for (qi, (s, i)) in results.into_iter().enumerate() {
-            for j in 0..s.len().min(k) {
-                top_scores[[qi, j]] = s[j];
-                top_indices[[qi, j]] = i[j];
-            }
+        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
+            .step_by(NQ_BATCH)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .flat_map(|qi_start| {
+                let qi_end = (qi_start + NQ_BATCH).min(nq);
+                let batch_nq = qi_end - qi_start;
+
+                let pad_qi = qi_end - 1;
+                let lut_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                    .map(|i| {
+                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                        query_luts[qi].uint8_luts.as_slice()
+                    })
+                    .collect();
+                let scale_vals: Vec<f32> = (0..NQ_BATCH)
+                    .map(|i| {
+                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                        query_luts[qi].scale
+                    })
+                    .collect();
+                let bias_vals: Vec<f32> = (0..NQ_BATCH)
+                    .map(|i| {
+                        let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                        query_luts[qi].bias
+                    })
+                    .collect();
+
+                // Per-query heaps
+                let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
+                    .map(|_| vec![f32::NEG_INFINITY; k]).collect();
+                let mut heap_indices: Vec<Vec<u32>> = (0..batch_nq)
+                    .map(|_| vec![0u32; k]).collect();
+                let mut heap_sizes = vec![0usize; batch_nq];
+                let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
+                let mut heap_min_idxs = vec![0usize; batch_nq];
+
+                unsafe {
+                    if is_x86_feature_detected!("avx2") {
+                        search_multi_query_avx2(
+                            codes_slice, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, norms_slice, n_vectors,
+                            batch_nq, k,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    }
+                }
+
+                // Sort each query's heap
+                let mut batch_results = Vec::with_capacity(batch_nq);
+                for qo in 0..batch_nq {
+                    let sz = heap_sizes[qo];
+                    let mut pairs: Vec<(f32, u32)> = heap_scores[qo][..sz].iter()
+                        .zip(heap_indices[qo][..sz].iter())
+                        .map(|(&s, &i)| (s, i)).collect();
+                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    batch_results.push((
+                        pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
+                        pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
+                    ));
+                }
+                batch_results
+            })
+            .collect();
+        results
+    };
+
+    let mut top_scores = Array2::<f32>::zeros((nq, k));
+    let mut top_indices = Array2::<i64>::zeros((nq, k));
+    for (qi, (s, i)) in results.into_iter().enumerate() {
+        for j in 0..s.len().min(k) {
+            top_scores[[qi, j]] = s[j];
+            top_indices[[qi, j]] = i[j];
         }
-
-        (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
     }
+
+    let t_score = t_score_start.elapsed().as_micros();
+    eprintln!("search_inner({nq}q): rot={t_rot}us, lut={t_lut}us, score+heap={t_score}us, total={}us",
+              t_rot + t_lut + t_score);
+
+    (top_scores, top_indices)
 }
+// EVOLVE-BLOCK-END

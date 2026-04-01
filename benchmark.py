@@ -94,6 +94,19 @@ def recall_at_1_at_k(true_top1, predicted_indices, k):
     return np.mean([true_top1[i] in predicted_indices[i, :k] for i in range(len(true_top1))])
 
 
+def bench_search(index, queries, k, n_runs=25):
+    # Warmup
+    index.search(queries[:1], k)
+
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        _, indices = index.search(queries, k)
+        times.append(time.perf_counter() - t0)
+    median_time = sorted(times)[len(times) // 2]
+    return median_time, indices
+
+
 def run_benchmark(database, queries, bit_widths, label=""):
     n, dim = database.shape
     n_queries = len(queries)
@@ -113,9 +126,7 @@ def run_benchmark(database, queries, bit_widths, label=""):
         file_size = os.path.getsize("/tmp/bench.tq")
         loaded = TurboQuantIndex.load("/tmp/bench.tq")
 
-        t0 = time.time()
-        _, all_indices = loaded.search(queries, k=64)
-        search_time = time.time() - t0
+        search_time, all_indices = bench_search(loaded, queries, k=64)
 
         recalls = {}
         for k in [1, 2, 4, 8, 16, 32, 64]:
@@ -146,7 +157,8 @@ def run_benchmark(database, queries, bit_widths, label=""):
     print(f"  {'Size':>7}  " + "  ".join(f"{results[bw]['file_size'] / 1024 / 1024:>7.1f} MB" for bw in bit_widths))
     print(f"  {'Comp.':>7}  " + "  ".join(f"{original_mb / (results[bw]['file_size'] / 1024 / 1024):>8.1f}x" for bw in bit_widths))
     print(f"  {'Index':>7}  " + "  ".join(f"{results[bw]['encode_time']*1000:>7.0f} ms" for bw in bit_widths))
-    print(f"  {'Search':>7}  " + "  ".join(f"{results[bw]['search_time'] / n_queries * 1000:>5.1f}ms/q" for bw in bit_widths))
+    n_threads = os.environ.get("RAYON_NUM_THREADS", "all")
+    print(f"  {'Search':>7}  " + "  ".join(f"{results[bw]['search_time'] / n_queries * 1000:>5.3f}ms/q" for bw in bit_widths) + f"  ({n_threads} threads, median of 25 runs)")
 
 
 def run_add_benchmark(database, bit_widths, label=""):

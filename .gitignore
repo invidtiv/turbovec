@@ -5,3 +5,5 @@ __pycache__/
 *.npy
 codebooks.npz
 target/
+evolve/
+evolve_rust/
