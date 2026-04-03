@@ -4,8 +4,6 @@ Fast vector quantization in Rust with Python bindings. Compresses vectors to 2-4
 
 Unlike trained methods like FAISS PQ, TurboQuant is **data-oblivious** — no training step, no codebook retraining when data changes, and new vectors can be added at any time. This means faster index creation, simpler infrastructure, and comparable or higher recall.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=RyanCodrai/turbovec&type=Date)](https://star-history.com/#RyanCodrai/turbovec&Date)
-
 ## Python
 
 ```python
@@ -132,6 +130,8 @@ Results are saved as JSON to `benchmarks/results/`. Regenerate charts:
 ```bash
 python3 benchmarks/create_diagrams.py
 ```
+
+[![Star History Chart](https://api.star-history.com/svg?repos=RyanCodrai/turbovec&type=Date)](https://star-history.com/#RyanCodrai/turbovec&Date)
 
 ## References
 
