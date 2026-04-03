@@ -4,9 +4,7 @@ Fast vector quantization in Rust with Python bindings. Compresses vectors to 2-4
 
 Unlike trained methods like FAISS PQ, TurboQuant is **data-oblivious** — no training step, no codebook retraining when data changes, and new vectors can be added at any time. This means faster index creation, simpler infrastructure, and comparable or higher recall.
 
-## Usage
-
-### Python
+## Python
 
 ```python
 from turbovec import TurboQuantIndex
@@ -21,7 +19,7 @@ index.write("my_index.tq")
 loaded = TurboQuantIndex.load("my_index.tq")
 ```
 
-### Rust
+## Rust
 
 ```rust
 use turbovec::TurboQuantIndex;
