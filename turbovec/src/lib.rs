@@ -124,11 +124,10 @@ impl TurboQuantIndex {
 
         let rotation = self
             .rotation
-            .get_or_init(|| rotation::make_rotation_matrix(self.dim))
-            .clone();
+            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
         let (boundaries, _) = codebook::codebook(self.bit_width, self.dim);
         let (packed, norms) =
-            encode::encode(vectors, n, self.dim, &rotation, &boundaries, self.bit_width);
+            encode::encode(vectors, n, self.dim, rotation, &boundaries, self.bit_width);
 
         if self.n_vectors == 0 {
             self.packed_codes = packed;
