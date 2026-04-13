@@ -1,7 +1,6 @@
 //! Encode vectors: normalize, rotate, quantize, bit-pack.
 
-use ndarray::{Array2, ArrayView2, s};
-use rayon::prelude::*;
+use ndarray::ArrayView2;
 
 /// Encode n vectors of dimension dim.
 /// Returns (packed_codes as flat Vec<u8>, norms as Vec<f32>).

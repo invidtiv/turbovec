@@ -484,9 +484,12 @@ unsafe fn search_multi_query_avx2(
     }
 }
 
-/// Repack 3-bit codes into two blocked arrays:
-/// - sub_codes: 2-bit nibble format from planes 0,1
+/// Score one block for TWO queries, sharing code loads and nibble splits.
+//
+// Not yet wired into the dispatch loop — see issue:
+// "Wire up multi-query NEON kernels for ARM throughput".
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 unsafe fn score_2query_block_neon(
     blocked_codes: &[u8],
     luts_a: &[u8],
@@ -607,7 +610,11 @@ unsafe fn score_2query_block_neon(
 
 /// Score one block for FOUR queries, sharing code loads and nibble splits.
 /// Codes loaded once, nibbles split once, then looked up in 4 different LUTs.
+//
+// Not yet wired into the dispatch loop — see issue:
+// "Wire up multi-query NEON kernels for ARM throughput".
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 unsafe fn score_4query_block_neon(
     blocked_codes: &[u8],
     luts: [&[u8]; 4],
@@ -708,19 +715,7 @@ struct QueryNeonLut {
 }
 
 
-/// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation array.
-fn build_query_neon_lut(
-    q_rot: &[f32],   // (nq, dim) flat
-    qi: usize,
-    dim: usize,
-    centroids: &[f32],
-    bits: usize,
-    _dim2: usize,   // unused, kept for compat
-) -> QueryNeonLut {
-    let row = &q_rot[qi * dim..(qi + 1) * dim];
-    build_query_neon_lut_from_slice(row, centroids, bits, dim)
-}
-
+/// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
 fn build_query_neon_lut_from_slice(
     q_rot_row: &[f32],
     centroids: &[f32],

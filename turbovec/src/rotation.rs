@@ -4,7 +4,6 @@
 //! a seeded Gaussian random matrix. The rotation makes each coordinate
 //! of a unit vector follow a known Beta distribution.
 
-use faer::prelude::*;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
