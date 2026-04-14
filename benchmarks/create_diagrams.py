@@ -1,177 +1,405 @@
+"""Generate benchmark charts as SVG in the turboquant-wasm aesthetic.
+
+Reads JSON files from ./results/ and writes:
+  ../docs/arm_speed.svg
+  ../docs/x86_speed.svg
+  ../docs/recall.svg
+  ../docs/compression.svg
 """
-Create benchmark comparison bar charts.
 
-Generates:
-  - arm_speed.png: ARM (M3 Max) search latency, TQ vs FAISS
-  - x86_speed.png: x86 (Sapphire Rapids) search latency, TQ vs FAISS
+import json
+import math
+import os
+
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
+DOCS_DIR = os.path.join(os.path.dirname(__file__), "..", "docs")
+
+FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+C = {
+    "title": "#0f172a",
+    "subtitle": "#475569",
+    "label": "#0f172a",
+    "secondary": "#475569",
+    "tick": "#64748b",
+    "axis": "#334155",
+    "grid": "#e5e7eb",
+    "baseline": "#94a3b8",
+    "tq": "#635bff",
+    "tq_stroke": "#4338ca",
+    "tq_text": "#4338ca",
+    "faiss": "#9aa7b6",
+    "fp32": "#9aa7b6",
+    "four_bit": "#1d4ed8",
+    "two_bit": "#635bff",
+    "tq_2": "#635bff",
+    "tq_4": "#0f766e",
+    "faiss_2": "#9aa7b6",
+    "faiss_4": "#64748b",
+}
+
+
+def xe(s):
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def nice_ceil(value):
+    if value <= 1:
+        return 1
+    exponent = math.floor(math.log10(value))
+    fraction = value / 10 ** exponent
+    if fraction <= 1:
+        nf = 1
+    elif fraction <= 2:
+        nf = 2
+    elif fraction <= 5:
+        nf = 5
+    else:
+        nf = 10
+    return nf * 10 ** exponent
+
+
+def style_block():
+    return (
+        f'<style>\n'
+        f'  .title {{ font: 700 20px {FONT}; fill: {C["title"]}; }}\n'
+        f'  .subtitle {{ font: 400 12px {FONT}; fill: {C["subtitle"]}; }}\n'
+        f'  .panel {{ font: 700 14px {FONT}; fill: {C["title"]}; }}\n'
+        f'  .label {{ font: 600 12px {FONT}; fill: {C["label"]}; }}\n'
+        f'  .secondary {{ font: 400 11px {FONT}; fill: {C["secondary"]}; }}\n'
+        f'  .tick {{ font: 400 11px {FONT}; fill: {C["tick"]}; }}\n'
+        f'  .value {{ font: 700 11px {FONT}; fill: {C["label"]}; }}\n'
+        f'  .value-accent {{ font: 700 11px {FONT}; fill: {C["tq_text"]}; }}\n'
+        f'  .axis {{ font: 600 12px {FONT}; fill: {C["axis"]}; }}\n'
+        f'  .legend {{ font: 600 12px {FONT}; fill: {C["label"]}; }}\n'
+        f'</style>'
+    )
+
+
+def grid_lines(px, py, pw, ph, y_lo, y_hi, fmt, step_count=5):
+    parts = []
+    for i in range(step_count + 1):
+        v = y_lo + (y_hi - y_lo) * i / step_count
+        y = py + ph - (v - y_lo) / (y_hi - y_lo) * ph
+        parts.append(
+            f'<line x1="{px}" y1="{y:.1f}" x2="{px + pw}" y2="{y:.1f}" stroke="{C["grid"]}" stroke-width="1" />'
+        )
+        parts.append(
+            f'<text x="{px - 10}" y="{y + 4:.1f}" text-anchor="end" class="tick">{xe(fmt(v))}</text>'
+        )
+    parts.append(
+        f'<line x1="{px}" y1="{py + ph:.1f}" x2="{px + pw}" y2="{py + ph:.1f}" stroke="{C["baseline"]}" stroke-width="1.5" />'
+    )
+    return "\n".join(parts)
+
+
+def paired_panel(px, py, pw, ph, panel_title, groups, tick_fmt, value_fmt, y_max):
+    parts = [grid_lines(px, py, pw, ph, 0, y_max, tick_fmt)]
+    parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(panel_title)}</text>')
+    n = len(groups)
+    band = pw / n
+    bar_w = min(44, band * 0.32)
+    gap = 6
+    for i, g in enumerate(groups):
+        cx = px + band * i + band / 2
+        tq_x = cx - bar_w - gap / 2
+        faiss_x = cx + gap / 2
+        tq_h = (g["tq"] / y_max) * ph
+        faiss_h = (g["faiss"] / y_max) * ph
+        tq_y = py + ph - tq_h
+        faiss_y = py + ph - faiss_h
+        label_y = py + ph + 22
+        parts.append(
+            f'<rect x="{tq_x:.1f}" y="{tq_y:.1f}" width="{bar_w}" height="{tq_h:.1f}" rx="6" '
+            f'fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
+        )
+        parts.append(
+            f'<rect x="{faiss_x:.1f}" y="{faiss_y:.1f}" width="{bar_w}" height="{faiss_h:.1f}" rx="6" fill="{C["faiss"]}" />'
+        )
+        parts.append(
+            f'<text x="{tq_x + bar_w/2:.1f}" y="{tq_y - 6:.1f}" text-anchor="middle" class="value-accent">{xe(value_fmt(g["tq"]))}</text>'
+        )
+        parts.append(
+            f'<text x="{faiss_x + bar_w/2:.1f}" y="{faiss_y - 6:.1f}" text-anchor="middle" class="value">{xe(value_fmt(g["faiss"]))}</text>'
+        )
+        primary, _, secondary = g["label"].partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        if secondary:
+            parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
+    return "\n".join(parts)
+
+
+def legend_tq_faiss(x, y):
+    parts = [
+        f'<rect x="{x}" y="{y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />',
+        f'<text x="{x + 22}" y="{y + 1}" class="legend" style="fill: {C["tq_text"]};">TurboQuant</text>',
+        f'<rect x="{x + 140}" y="{y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />',
+        f'<text x="{x + 162}" y="{y + 1}" class="legend">FAISS</text>',
+    ]
+    return "\n".join(parts)
+
+
+def load_json(name):
+    with open(os.path.join(RESULTS_DIR, name)) as f:
+        return json.load(f)
+
+
+def speed_panels(arch):
+    panels = {"st": [], "mt": []}
+    for dim in (1536, 3072):
+        for bw in (2, 4):
+            for th in ("st", "mt"):
+                entry = load_json(f"speed_d{dim}_{bw}bit_{arch}_{th}.json")
+                panels[th].append(
+                    {
+                        "label": f"d={dim}|{bw}-bit",
+                        "tq": entry["tq_ms_per_query"],
+                        "faiss": entry["faiss_ms_per_query"],
+                    }
+                )
+    return panels
+
+
+def write_speed_chart(arch, hw_label, filename):
+    panels = speed_panels(arch)
+    width, height = 1400, 480
+    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
+    panel_gap = 72
+    pw = (width - margin["left"] - margin["right"] - panel_gap) / 2
+    ph = height - margin["top"] - margin["bottom"]
+    p1x = margin["left"]
+    p2x = margin["left"] + pw + panel_gap
+    py = margin["top"]
+
+    max_st = max(max(g["tq"], g["faiss"]) for g in panels["st"])
+    max_mt = max(max(g["tq"], g["faiss"]) for g in panels["mt"])
+    y_st = nice_ceil(max_st * 1.22)
+    y_mt = nice_ceil(max_mt * 1.22)
+
+    parts = [
+        paired_panel(
+            p1x, py, pw, ph, "Single-threaded", panels["st"],
+            tick_fmt=lambda v: f"{v:.1f}",
+            value_fmt=lambda v: f"{v:.2f}",
+            y_max=y_st,
+        ),
+        paired_panel(
+            p2x, py, pw, ph, "Multi-threaded", panels["mt"],
+            tick_fmt=lambda v: f"{v:.2f}",
+            value_fmt=lambda v: f"{v:.3f}",
+            y_max=y_mt,
+        ),
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">ms / query</text>',
+        f'<text x="{p2x - 52}" y="{py + ph/2}" transform="rotate(-90, {p2x - 52}, {py + ph/2})" class="axis">ms / query</text>',
+        legend_tq_faiss(margin["left"], height - 26),
+    ]
+    body = "\n".join(parts)
+
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Search Latency — {xe(hw_label)}">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Search Latency — {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 1K queries, k=64, median of 5 runs</text>
+  {body}
+</svg>
 """
-
-import matplotlib.pyplot as plt
-import numpy as np
-
-# ARM results (Apple M3 Max, median of 5 runs)
-arm = {
-    "d1536_2bit_st": {"tq": 1.391, "faiss": 1.234},
-    "d1536_2bit_mt": {"tq": 0.131, "faiss": 0.128},
-    "d1536_4bit_st": {"tq": 2.580, "faiss": 2.451},
-    "d1536_4bit_mt": {"tq": 0.236, "faiss": 0.228},
-    "d3072_2bit_st": {"tq": 3.002, "faiss": 2.451},
-    "d3072_2bit_mt": {"tq": 0.328, "faiss": 0.224},
-    "d3072_4bit_st": {"tq": 5.370, "faiss": 4.923},
-    "d3072_4bit_mt": {"tq": 0.560, "faiss": 0.447},
-}
-
-# x86 results (Intel Sapphire Rapids, 4 vCPUs, median of 5 runs)
-x86 = {
-    "d1536_2bit_st": {"tq": 2.906, "faiss": 1.211},
-    "d1536_2bit_mt": {"tq": 1.048, "faiss": 0.588},
-    "d1536_4bit_st": {"tq": 4.447, "faiss": 2.489},
-    "d1536_4bit_mt": {"tq": 1.666, "faiss": 1.174},
-    "d3072_2bit_st": {"tq": 9.155, "faiss": 2.509},
-    "d3072_2bit_mt": {"tq": 2.872, "faiss": 1.173},
-    "d3072_4bit_st": {"tq": 12.409, "faiss": 5.039},
-    "d3072_4bit_mt": {"tq": 4.138, "faiss": 2.338},
-}
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
 
 
-def make_chart(data, title, filename):
-    configs_st = ["d1536_2bit_st", "d1536_4bit_st", "d3072_2bit_st", "d3072_4bit_st"]
-    configs_mt = ["d1536_2bit_mt", "d1536_4bit_mt", "d3072_2bit_mt", "d3072_4bit_mt"]
-    labels_st = ["d=1536\n2-bit", "d=1536\n4-bit", "d=3072\n2-bit", "d=3072\n4-bit"]
-    labels_mt = labels_st
+def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_hi):
+    parts = [
+        grid_lines(px, py, pw, ph, y_lo, y_hi, lambda v: f"{v:.2f}"),
+        f'<text x="{px}" y="{py - 14}" class="panel">{xe(panel_title)}</text>',
+    ]
+    x_min = math.log2(x_values[0])
+    x_max = math.log2(x_values[-1])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    def xpx(v):
+        return px + (math.log2(v) - x_min) / (x_max - x_min) * pw
 
-    # Single-threaded
-    x = np.arange(len(configs_st))
-    w = 0.35
-    tq_vals = [data[c]["tq"] for c in configs_st]
-    faiss_vals = [data[c]["faiss"] for c in configs_st]
-    bars1 = ax1.bar(x - w/2, tq_vals, w, label="TurboQuant", color="#4C72B0")
-    bars2 = ax1.bar(x + w/2, faiss_vals, w, label="FAISS", color="#DD8452")
-    ax1.set_ylabel("ms / query")
-    ax1.set_title("Single-threaded")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels_st)
-    ax1.legend()
-    for bar in bars1:
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                 f"{bar.get_height():.2f}", ha="center", va="bottom", fontsize=8)
-    for bar in bars2:
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                 f"{bar.get_height():.2f}", ha="center", va="bottom", fontsize=8)
+    def ypx(v):
+        return py + ph - (v - y_lo) / (y_hi - y_lo) * ph
 
-    # Multi-threaded
-    tq_vals = [data[c]["tq"] for c in configs_mt]
-    faiss_vals = [data[c]["faiss"] for c in configs_mt]
-    bars1 = ax2.bar(x - w/2, tq_vals, w, label="TurboQuant", color="#4C72B0")
-    bars2 = ax2.bar(x + w/2, faiss_vals, w, label="FAISS", color="#DD8452")
-    ax2.set_ylabel("ms / query")
-    ax2.set_title("Multi-threaded")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(labels_mt)
-    ax2.legend()
-    for bar in bars1:
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                 f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=8)
-    for bar in bars2:
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                 f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=8)
+    for v, lbl in zip(x_values, x_labels):
+        parts.append(
+            f'<text x="{xpx(v):.1f}" y="{py + ph + 20}" text-anchor="middle" class="label">{xe(lbl)}</text>'
+        )
 
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches="tight")
-    print(f"Saved {filename}")
+    for s in series:
+        color = s["color"]
+        dash = ' stroke-dasharray="6 4"' if s.get("dashed") else ""
+        points = [(xpx(x), ypx(y)) for x, y in zip(x_values, s["values"])]
+        path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.25"{dash} />'
+        )
+        for x, y in points:
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" fill="{color}" />')
+
+    return "\n".join(parts)
 
 
-# Recall results (TQ vs FAISS)
-recall = {
-    "d1536_2bit": {
-        "tq":    {"1": 0.870, "2": 0.961, "4": 0.998, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-        "faiss": {"1": 0.882, "2": 0.973, "4": 0.996, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-    },
-    "d1536_4bit": {
-        "tq":    {"1": 0.955, "2": 0.996, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-        "faiss": {"1": 0.956, "2": 0.998, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-    },
-    "d3072_2bit": {
-        "tq":    {"1": 0.912, "2": 0.986, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-        "faiss": {"1": 0.903, "2": 0.977, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-    },
-    "d3072_4bit": {
-        "tq":    {"1": 0.967, "2": 0.997, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-        "faiss": {"1": 0.967, "2": 0.998, "4": 1.000, "8": 1.000, "16": 1.000, "32": 1.000, "64": 1.000},
-    },
-}
+def write_recall_chart(filename):
+    width, height = 1400, 480
+    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
+    panel_gap = 72
+    pw = (width - margin["left"] - margin["right"] - panel_gap) / 2
+    ph = height - margin["top"] - margin["bottom"]
+    py = margin["top"]
+
+    x_values = [1, 2, 4, 8, 16]
+    x_labels = ["1", "2", "4", "8", "16"]
+
+    parts = []
+    for idx, (dim_key, dim_label) in enumerate([("d1536", "d=1536"), ("d3072", "d=3072")]):
+        px = margin["left"] + idx * (pw + panel_gap)
+        series = []
+        for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
+            data = load_json(f"recall_{dim_key}_{bw_key}.json")
+            tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
+            faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
+            tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
+            faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
+            series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
+            series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
+        parts.append(line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, 0.85, 1.005))
+        parts.append(
+            f'<text x="{px - 62}" y="{py + ph/2}" transform="rotate(-90, {px - 62}, {py + ph/2})" class="axis">recall@1@k</text>'
+        )
+        parts.append(
+            f'<text x="{px + pw/2}" y="{py + ph + 48}" text-anchor="middle" class="axis">k</text>'
+        )
+
+    legend_y = height - 26
+    lx = margin["left"]
+    items = [
+        ("TQ 2-bit", C["tq_2"], False),
+        ("TQ 4-bit", C["tq_4"], False),
+        ("FAISS 2-bit", C["faiss_2"], True),
+        ("FAISS 4-bit", C["faiss_4"], True),
+    ]
+    for i, (lbl, col, dash) in enumerate(items):
+        cx = lx + i * 140
+        dash_attr = ' stroke-dasharray="6 4"' if dash else ""
+        parts.append(
+            f'<line x1="{cx}" y1="{legend_y - 2}" x2="{cx + 24}" y2="{legend_y - 2}" stroke="{col}" stroke-width="2.25"{dash_attr} />'
+        )
+        parts.append(f'<circle cx="{cx + 12}" cy="{legend_y - 2}" r="3.5" fill="{col}" />')
+        parts.append(f'<text x="{cx + 32}" y="{legend_y + 1}" class="legend">{xe(lbl)}</text>')
+
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Recall — TurboQuant vs FAISS">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Recall — TurboQuant vs FAISS</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, k=64 search. recall@1@k measures how often the true top-1 result appears in the top-k returned.</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
 
 
-def make_recall_chart(data, filename):
-    ks_str = ["1", "2", "4", "8", "16"]
-    ks_int = [1, 2, 4, 8, 16]
+def write_compression_chart(filename):
+    datasets = [
+        ("GloVe|d=200", 76.3, 9.9, 5.1),
+        ("OpenAI|d=1536", 585.9, 73.6, 37.0),
+        ("OpenAI|d=3072", 1171.9, 146.9, 73.6),
+    ]
+    width, height = 900, 460
+    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
+    pw = width - margin["left"] - margin["right"]
+    ph = height - margin["top"] - margin["bottom"]
+    px = margin["left"]
+    py = margin["top"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    y_max = nice_ceil(max(d[1] for d in datasets) * 1.15)
 
-    for ax, dim, title in [(ax1, "d1536", "d=1536"), (ax2, "d3072", "d=3072")]:
-        for bw, ls_tq, ls_f, marker_tq, marker_f in [("2bit", "-", "--", "o", "s"), ("4bit", "-", "--", "^", "D")]:
-            config = f"{dim}_{bw}"
-            tq_vals = [data[config]["tq"][k] for k in ks_str]
-            faiss_vals = [data[config]["faiss"][k] for k in ks_str]
-            bw_label = bw.replace("bit", "-bit")
-            ax.plot(ks_int, tq_vals, f"{marker_tq}{ls_tq}", label=f"TQ {bw_label}", color="#4C72B0" if bw == "2bit" else "#55A868", linewidth=2, markersize=6)
-            ax.plot(ks_int, faiss_vals, f"{marker_f}{ls_f}", label=f"FAISS {bw_label}", color="#DD8452" if bw == "2bit" else "#C44E52", linewidth=2, markersize=6)
+    parts = [grid_lines(px, py, pw, ph, 0, y_max, lambda v: f"{v:.0f}")]
 
-        ax.set_title(title)
-        ax.set_xlabel("k")
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(ks_int)
-        ax.set_xticklabels(ks_str)
-        ax.set_ylim(0.85, 1.005)
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=9)
+    n = len(datasets)
+    band = pw / n
+    bar_w = min(56, band * 0.22)
+    gap = 10
 
-    ax1.set_ylabel("recall@1@k")
-    fig.suptitle("Recall — TurboQuant vs FAISS (100K vectors, k=64 search)", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches="tight")
-    print(f"Saved {filename}")
+    for i, (label, fp32, four, two) in enumerate(datasets):
+        cx = px + band * i + band / 2
+        x_fp = cx - 1.5 * bar_w - gap
+        x_4 = cx - 0.5 * bar_w
+        x_2 = cx + 0.5 * bar_w + gap
 
+        def draw(xbar, val, color, accent=False):
+            h = (val / y_max) * ph
+            y = py + ph - h
+            stroke = (
+                f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+            )
+            value_cls = "value-accent" if accent else "value"
+            return "\n".join(
+                [
+                    f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{color}"{stroke} />',
+                    f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{value_cls}">{xe(f"{val:.0f}")}</text>',
+                ]
+            )
 
-def make_compression_chart(filename):
-    datasets = ["GloVe\nd=200", "OpenAI\nd=1536", "OpenAI\nd=3072"]
-    fp32 = [76.3, 585.9, 1171.9]
-    two_bit = [5.1, 37.0, 73.6]
-    four_bit = [9.9, 73.6, 146.9]
+        parts.append(draw(x_fp, fp32, C["fp32"]))
+        parts.append(draw(x_4, four, C["four_bit"]))
+        parts.append(draw(x_2, two, C["two_bit"], accent=True))
 
-    x = np.arange(len(datasets))
-    w = 0.25
+        label_y = py + ph + 22
+        primary, _, secondary = label.partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        if secondary:
+            parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(x - w, fp32, w, label="FP32", color="#C44E52")
-    ax.bar(x, four_bit, w, label="4-bit", color="#DD8452")
-    ax.bar(x + w, two_bit, w, label="2-bit", color="#4C72B0")
+    parts.append(
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">Index size (MB)</text>'
+    )
 
-    for i in range(len(datasets)):
-        ax.text(x[i] - w, fp32[i] + 15, f"{fp32[i]:.0f}", ha="center", fontsize=9)
-        ax.text(x[i], four_bit[i] + 15, f"{four_bit[i]:.0f}", ha="center", fontsize=9)
-        ax.text(x[i] + w, two_bit[i] + 15, f"{two_bit[i]:.0f}", ha="center", fontsize=9)
+    legend_y = height - 26
+    lx = margin["left"]
+    items = [
+        ("FP32", C["fp32"], False),
+        ("4-bit", C["four_bit"], False),
+        ("2-bit", C["two_bit"], True),
+    ]
+    for i, (lbl, col, accent) in enumerate(items):
+        lcx = lx + i * 120
+        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+        parts.append(f'<rect x="{lcx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{col}"{stroke} />')
+        parts.append(f'<text x="{lcx + 22}" y="{legend_y + 1}" class="legend">{xe(lbl)}</text>')
 
-    ax.set_ylabel("Index size (MB)")
-    ax.set_title("Index Size — 100K vectors", fontsize=14, fontweight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches="tight")
-    print(f"Saved {filename}")
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Index Size — TurboQuant">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Index Size — 100K vectors</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">TurboQuant packs vectors ~16× smaller than FP32 at 2-bit with comparable recall</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":
-    import os
-    out_dir = os.path.join(os.path.dirname(__file__), "results")
-    os.makedirs(out_dir, exist_ok=True)
-    make_chart(arm, "Search Latency — ARM (Apple M3 Max)", os.path.join(out_dir, "arm_speed.png"))
-    make_chart(x86, "Search Latency — x86 (Intel Sapphire Rapids, 4 vCPU)", os.path.join(out_dir, "x86_speed.png"))
-    make_recall_chart(recall, os.path.join(out_dir, "recall.png"))
-    make_compression_chart(os.path.join(out_dir, "compression.png"))
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    write_speed_chart("arm", "ARM (Apple M3 Max)", "arm_speed.svg")
+    write_speed_chart("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "x86_speed.svg")
+    write_recall_chart("recall.svg")
+    write_compression_chart("compression.svg")
