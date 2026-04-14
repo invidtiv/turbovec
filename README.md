@@ -43,7 +43,9 @@ let loaded = TurboQuantIndex::load("index.tv").unwrap();
 
 TurboQuant vs FAISS IndexPQFastScan (100K vectors, k=64). FAISS PQ configurations sized to match TurboQuant compression ratios.
 
-![Recall](docs/recall.svg)
+![Recall d=1536](docs/recall_d1536.svg)
+
+![Recall d=3072](docs/recall_d3072.svg)
 
 Both converge to 1.0 by k=4-8. At d=3072 2-bit, TurboQuant recall exceeds FAISS (0.912 vs 0.903). At d=1536 2-bit, FAISS is slightly ahead (0.882 vs 0.870). The recall discrepancy between TQ and FAISS varies by dimension and bit width — this requires further investigation. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
 
@@ -59,13 +61,17 @@ All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
 ### ARM (Apple M3 Max)
 
-![ARM Speed](docs/arm_speed.svg)
+![ARM Speed — Single-threaded](docs/arm_speed_st.svg)
+
+![ARM Speed — Multi-threaded](docs/arm_speed_mt.svg)
 
 On ARM, TurboQuant beats FAISS FastScan by 13–20% across every config.
 
 ### x86 (Intel Sapphire Rapids, 4 vCPUs)
 
-![x86 Speed](docs/x86_speed.svg)
+![x86 Speed — Single-threaded](docs/x86_speed_st.svg)
+
+![x86 Speed — Multi-threaded](docs/x86_speed_mt.svg)
 
 On x86, TurboQuant is 10–29% behind FAISS. Optimization is ongoing.
 

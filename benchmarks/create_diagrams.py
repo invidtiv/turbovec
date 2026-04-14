@@ -1,9 +1,9 @@
 """Generate benchmark charts as SVG in the turboquant-wasm aesthetic.
 
 Reads JSON files from ./results/ and writes:
-  ../docs/arm_speed.svg
-  ../docs/x86_speed.svg
-  ../docs/recall.svg
+  ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
+  ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
+  ../docs/recall_d1536.svg, ../docs/recall_d3072.svg
   ../docs/compression.svg
 """
 
@@ -55,6 +55,8 @@ def nice_ceil(value):
     fraction = value / 10 ** exponent
     if fraction <= 1:
         nf = 1
+    elif fraction <= 1.5:
+        nf = 1.5
     elif fraction <= 2:
         nf = 2
     elif fraction <= 5:
@@ -165,46 +167,34 @@ def speed_panels(arch):
     return panels
 
 
-def write_speed_chart(arch, hw_label, filename):
+def write_speed_panel(arch, hw_label, thread_key, thread_label, tick_fmt, value_fmt, filename):
     panels = speed_panels(arch)
-    width, height = 1400, 480
+    width, height = 900, 460
     margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    panel_gap = 72
-    pw = (width - margin["left"] - margin["right"] - panel_gap) / 2
+    pw = width - margin["left"] - margin["right"]
     ph = height - margin["top"] - margin["bottom"]
-    p1x = margin["left"]
-    p2x = margin["left"] + pw + panel_gap
+    px = margin["left"]
     py = margin["top"]
 
-    max_st = max(max(g["tq"], g["faiss"]) for g in panels["st"])
-    max_mt = max(max(g["tq"], g["faiss"]) for g in panels["mt"])
-    y_st = nice_ceil(max_st * 1.22)
-    y_mt = nice_ceil(max_mt * 1.22)
+    y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in panels[thread_key]) * 1.22)
 
     parts = [
         paired_panel(
-            p1x, py, pw, ph, "Single-threaded", panels["st"],
-            tick_fmt=lambda v: f"{v:.1f}",
-            value_fmt=lambda v: f"{v:.2f}",
-            y_max=y_st,
-        ),
-        paired_panel(
-            p2x, py, pw, ph, "Multi-threaded", panels["mt"],
-            tick_fmt=lambda v: f"{v:.2f}",
-            value_fmt=lambda v: f"{v:.3f}",
-            y_max=y_mt,
+            px, py, pw, ph, thread_label, panels[thread_key],
+            tick_fmt=tick_fmt,
+            value_fmt=value_fmt,
+            y_max=y_max,
         ),
         f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">ms / query</text>',
-        f'<text x="{p2x - 52}" y="{py + ph/2}" transform="rotate(-90, {p2x - 52}, {py + ph/2})" class="axis">ms / query</text>',
         legend_tq_faiss(margin["left"], height - 26),
     ]
     body = "\n".join(parts)
 
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Search Latency — {xe(hw_label)}">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Search Latency — {xe(hw_label)} — {xe(thread_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Search Latency — {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="32" class="title">Search Latency — {xe(hw_label)} — {xe(thread_label)}</text>
   <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 1K queries, k=64, median of 5 runs</text>
   {body}
 </svg>
@@ -248,36 +238,32 @@ def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_
     return "\n".join(parts)
 
 
-def write_recall_chart(filename):
-    width, height = 1400, 480
+def write_recall_panel(dim_key, dim_label, filename):
+    width, height = 900, 460
     margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    panel_gap = 72
-    pw = (width - margin["left"] - margin["right"] - panel_gap) / 2
+    pw = width - margin["left"] - margin["right"]
     ph = height - margin["top"] - margin["bottom"]
+    px = margin["left"]
     py = margin["top"]
 
     x_values = [1, 2, 4, 8, 16]
     x_labels = ["1", "2", "4", "8", "16"]
 
-    parts = []
-    for idx, (dim_key, dim_label) in enumerate([("d1536", "d=1536"), ("d3072", "d=3072")]):
-        px = margin["left"] + idx * (pw + panel_gap)
-        series = []
-        for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
-            data = load_json(f"recall_{dim_key}_{bw_key}.json")
-            tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
-            faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
-            tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
-            faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
-            series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
-            series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
-        parts.append(line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, 0.85, 1.005))
-        parts.append(
-            f'<text x="{px - 62}" y="{py + ph/2}" transform="rotate(-90, {px - 62}, {py + ph/2})" class="axis">recall@1@k</text>'
-        )
-        parts.append(
-            f'<text x="{px + pw/2}" y="{py + ph + 48}" text-anchor="middle" class="axis">k</text>'
-        )
+    series = []
+    for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
+        data = load_json(f"recall_{dim_key}_{bw_key}.json")
+        tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
+        faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
+        tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
+        faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
+        series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
+        series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
+
+    parts = [
+        line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, 0.85, 1.005),
+        f'<text x="{px - 62}" y="{py + ph/2}" transform="rotate(-90, {px - 62}, {py + ph/2})" class="axis">recall@1@k</text>',
+        f'<text x="{px + pw/2}" y="{py + ph + 48}" text-anchor="middle" class="axis">k</text>',
+    ]
 
     legend_y = height - 26
     lx = margin["left"]
@@ -298,10 +284,10 @@ def write_recall_chart(filename):
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Recall — TurboQuant vs FAISS">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Recall — {xe(dim_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Recall — TurboQuant vs FAISS</text>
+  <text x="{margin["left"]}" y="32" class="title">Recall — {xe(dim_label)}</text>
   <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, k=64 search. recall@1@k measures how often the true top-1 result appears in the top-k returned.</text>
   {body}
 </svg>
@@ -399,7 +385,18 @@ def write_compression_chart(filename):
 
 if __name__ == "__main__":
     os.makedirs(DOCS_DIR, exist_ok=True)
-    write_speed_chart("arm", "ARM (Apple M3 Max)", "arm_speed.svg")
-    write_speed_chart("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "x86_speed.svg")
-    write_recall_chart("recall.svg")
+    write_speed_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+                      tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
+                      filename="arm_speed_st.svg")
+    write_speed_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
+                      tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
+                      filename="arm_speed_mt.svg")
+    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "st", "Single-threaded",
+                      tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
+                      filename="x86_speed_st.svg")
+    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "mt", "Multi-threaded",
+                      tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
+                      filename="x86_speed_mt.svg")
+    write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
+    write_recall_panel("d3072", "d=3072", "recall_d3072.svg")
     write_compression_chart("compression.svg")
