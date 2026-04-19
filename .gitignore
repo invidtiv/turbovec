@@ -1,6 +1,7 @@
 __pycache__/
 .cache/
 *.pyc
+*.bak
 *.tq
 *.npy
 codebooks.npz
