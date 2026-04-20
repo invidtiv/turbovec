@@ -36,10 +36,13 @@
 
 pub mod codebook;
 pub mod encode;
+pub mod id_map;
 pub mod io;
 pub mod pack;
 pub mod rotation;
 pub mod search;
+
+pub use id_map::IdMapIndex;
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -243,6 +246,48 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         })
+    }
+
+    /// Remove the vector at `idx` in O(1) by swapping with the last vector.
+    ///
+    /// Semantics match [`Vec::swap_remove`]: the last vector is moved into
+    /// the deleted slot, so **order is not preserved** and the index of the
+    /// previously-last vector changes. Any external references to the moved
+    /// vector's old index must be updated. For stable external IDs, wrap in
+    /// an ID-map layer.
+    ///
+    /// Returns the old index of the moved vector (`n_vectors - 1` before
+    /// the call); equals `idx` when `idx` was already the last element.
+    /// Panics if `idx >= n_vectors`.
+    pub fn swap_remove(&mut self, idx: usize) -> usize {
+        assert!(
+            idx < self.n_vectors,
+            "index {idx} out of bounds (n_vectors = {})",
+            self.n_vectors
+        );
+
+        let bytes_per_vec = self.dim * self.bit_width / 8;
+        let last = self.n_vectors - 1;
+
+        if idx != last {
+            // Move last vector's packed bytes into slot `idx`.
+            let src = last * bytes_per_vec;
+            let dst = idx * bytes_per_vec;
+            self.packed_codes.copy_within(src..src + bytes_per_vec, dst);
+
+            // Move last norm into slot `idx`.
+            self.norms[idx] = self.norms[last];
+        }
+
+        // Truncate both arrays.
+        self.packed_codes.truncate(last * bytes_per_vec);
+        self.norms.truncate(last);
+        self.n_vectors -= 1;
+
+        // Invalidate the blocked cache since it was derived from the old layout.
+        self.blocked = OnceLock::new();
+
+        last
     }
 
     pub fn len(&self) -> usize {
